@@ -4,8 +4,8 @@ import os
 import asyncio
 import uuid
 import datetime
+import json
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 # =========================
@@ -13,9 +13,11 @@ from discord.ext import commands
 # =========================
 TOKEN = os.getenv("DISCORD_TOKEN") or ""
 GUILD_ID = 1225075859333845154  # ваш сервер
+VOICE_CHANNEL_ID =GUILD_ID = 1225075859333845154  # ваш сервер
 VOICE_CHANNEL_ID = 1289694911234310155  # целевой войс
 NEWS_CHANNEL_ID = 1301325369919410196  # канал с новостями от вебхуков
-SOUND_FILE = "notification.mp3"  # локальный mp3/wav
+SOUND_FILE = "notification.mp3"        # локальный mp3/wav
+PETITIONS_FILE = "petitions.json"      # тут храним петиции
 
 # Роли-одобряющие
 APPROVER_ROLE_IDS = {
@@ -31,13 +33,16 @@ STATUS_ROLE_IDS = {
 }
 
 intents = discord.Intents.default()
-intents.members = True  # нужно для выборки участников по ролям
+intents.members = True
 intents.guilds = True
 intents.voice_states = True
-intents.messages = True  # содержимое не читаем; webhook_id доступен без message_content
+intents.messages = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Память петиции в процессе
+# =========================
+# Модель и хранилище петиций
+# =========================
+
 class PetitionState:
     def __init__(self, petition_id: str, author_id: int, guild_id: int):
         self.id = petition_id
@@ -53,8 +58,6 @@ class PetitionState:
 
 
 petitions: dict[str, PetitionState] = {}
-
-# Lock для контроля переподключения в войс
 voice_rejoin_lock = asyncio.Lock()
 
 # Цвета для разных статусов петиции
@@ -64,12 +67,67 @@ REJECTED_COLOR = discord.Color.from_rgb(255, 128, 128)   # мягкий крас
 FINISHED_COLOR = discord.Color.from_rgb(128, 255, 170)   # мягкий зелёный
 
 
+def serialize_petition(p: PetitionState) -> dict:
+    return {
+        "id": p.id,
+        "author_id": p.author_id,
+        "guild_id": p.guild_id,
+        "status": p.status,
+        "accepted_by": p.accepted_by,
+        "rejected_by": p.rejected_by,
+        "approvers": list(p.approvers),
+        # ключи в JSON должны быть строками
+        "approver_messages": {
+            str(k): [ch_id, msg_id] for k, (ch_id, msg_id) in p.approver_messages.items()
+        },
+    }
+
+
+def save_petitions():
+    data = {pid: serialize_petition(p) for pid, p in petitions.items()}
+    try:
+        with open(PETITIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[storage] save_petitions error: {e}")
+
+
+def load_petitions():
+    if not os.path.exists(PETITIONS_FILE):
+        return
+    try:
+        with open(PETITIONS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"[storage] load_petitions error: {e}")
+        return
+
+    for pid, pdata in raw.items():
+        p = PetitionState(
+            petition_id=pdata.get("id", pid),
+            author_id=pdata.get("author_id"),
+            guild_id=pdata.get("guild_id"),
+        )
+        p.status = pdata.get("status", "pending")
+        p.accepted_by = pdata.get("accepted_by")
+        p.rejected_by = pdata.get("rejected_by")
+        p.approvers = set(pdata.get("approvers", []))
+        p.approver_messages = {}
+        for k, v in pdata.get("approver_messages", {}).items():
+            try:
+                appr_id = int(k)
+                ch_id, msg_id = v
+                p.approver_messages[appr_id] = (int(ch_id), int(msg_id))
+            except Exception:
+                continue
+        petitions[p.id] = p
+
+
 def apply_status_to_embed(
     emb: discord.Embed,
     p: PetitionState,
     guild: discord.Guild | None
 ) -> discord.Embed:
-    """Обновляет цвет и поле 'Статус петиции' в зависимости от состояния."""
     if p.status == "pending":
         status_text = "Новая (ожидает решения)"
         color = PENDING_COLOR
@@ -101,7 +159,6 @@ def apply_status_to_embed(
         status_text = "Неизвестный статус"
         color = PENDING_COLOR
 
-    # Ищем/обновляем поле "Статус петиции"
     index = None
     for i, field in enumerate(emb.fields):
         if field.name == "Статус петиции":
@@ -117,9 +174,11 @@ def apply_status_to_embed(
     return emb
 
 
+# =========================
 # Утилиты
+# =========================
+
 def human_status(member: discord.Member) -> str:
-    # Возвращает самый "сильный" статус из заданных
     power = {"Виза": 1, "ПМЖ": 2, "Гражданство": 3}
     found = []
     for r in member.roles:
@@ -136,7 +195,6 @@ def member_has_any_role(member: discord.Member, role_ids: set[int]) -> bool:
 
 
 async def ensure_voice_in_guild(guild: discord.Guild) -> discord.VoiceClient | None:
-    """Убедиться, что бот подключён именно к VOICE_CHANNEL_ID."""
     target = guild.get_channel(VOICE_CHANNEL_ID)
     if not isinstance(target, discord.VoiceChannel):
         return None
@@ -189,10 +247,13 @@ def base_petition_embed(
     return emb
 
 
+# =========================
 # View’ы для одобряющих
+# =========================
+
 class ApproverView(discord.ui.View):
     def __init__(self, petition_id: str):
-        super().__init__(timeout=None)
+        super().__init__(timeout=None)  # timeout=None для persistent view
         self.petition_id = petition_id
 
     @discord.ui.button(
@@ -219,7 +280,6 @@ class ApproverView(discord.ui.View):
                 await interaction.response.send_message("Петиция уже обработана.", ephemeral=True)
                 return
 
-            # Принять
             p.status = "accepted"
             p.accepted_by = interaction.user.id
 
@@ -236,7 +296,7 @@ class ApproverView(discord.ui.View):
                 except Exception as e:
                     print(f"[petition] accept update error: {e}")
 
-            # На сообщении принявшего — кнопка "Завершить" + статус/цвет
+            # На сообщении принявшего — кнопка "Завершить"
             try:
                 ch_id, msg_id = p.approver_messages.get(interaction.user.id, (None, None))
                 if ch_id and msg_id:
@@ -266,7 +326,8 @@ class ApproverView(discord.ui.View):
                 except Exception:
                     pass
 
-            await interaction.response.defer()  # уже обновили сообщение
+            save_petitions()
+            await interaction.response.defer()
 
     @discord.ui.button(
         label="Отклонить",
@@ -292,7 +353,6 @@ class ApproverView(discord.ui.View):
                 await interaction.response.send_message("Петиция уже обработана.", ephemeral=True)
                 return
 
-            # Отклонить
             p.status = "rejected"
             p.rejected_by = interaction.user.id
 
@@ -325,12 +385,13 @@ class ApproverView(discord.ui.View):
                 except Exception:
                     pass
 
+            save_petitions()
             await interaction.response.defer()
 
 
 class FinishView(discord.ui.View):
     def __init__(self, petition_id: str):
-        super().__init__(timeout=None)
+        super().__init__(timeout=None)  # timeout=None для persistent view
         self.petition_id = petition_id
 
     @discord.ui.button(
@@ -368,7 +429,6 @@ class FinishView(discord.ui.View):
             except Exception as e:
                 print(f"[petition] finish update error: {e}")
 
-            # Сообщить автору
             author = guild.get_member(p.author_id)
             if author:
                 try:
@@ -376,12 +436,17 @@ class FinishView(discord.ui.View):
                 except Exception:
                     pass
 
-            await interaction.response.defer()
-            # Очистить из памяти
+            # Удаляем петицию из памяти и JSON
             petitions.pop(self.petition_id, None)
+            save_petitions()
+
+            await interaction.response.defer()
 
 
+# =========================
 # Modal для /petition
+# =========================
+
 class PetitionModal(discord.ui.Modal, title="Подача петиции"):
     reason = discord.ui.TextInput(
         label="Причина петиции (тема)",
@@ -410,7 +475,6 @@ class PetitionModal(discord.ui.Modal, title="Подача петиции"):
             await interaction.response.send_message("Сервер недоступен.", ephemeral=True)
             return
 
-        # Автор — член сервера?
         member = guild.get_member(interaction.user.id)
         if not member:
             try:
@@ -421,7 +485,6 @@ class PetitionModal(discord.ui.Modal, title="Подача петиции"):
             await interaction.response.send_message("Вы не являетесь участником сервера.", ephemeral=True)
             return
 
-        # Проверка права на петицию: наличие хотя бы одной статусной роли
         status = human_status(member)
         if status == "Нет статуса":
             await interaction.response.send_message(
@@ -430,18 +493,15 @@ class PetitionModal(discord.ui.Modal, title="Подача петиции"):
             )
             return
 
-        # Создать петицию
         petition_id = uuid.uuid4().hex[:8].upper()
         p = PetitionState(petition_id, member.id, guild.id)
         petitions[petition_id] = p
 
-        # Подтверждение автору
         await interaction.response.send_message(
             f"Ваша петиция № {petition_id} на рассмотрении.",
             ephemeral=True
         )
 
-        # Embed для одобряющих (с начальным статусом)
         emb = base_petition_embed(
             "Новая петиция",
             str(self.reason),
@@ -451,7 +511,6 @@ class PetitionModal(discord.ui.Modal, title="Подача петиции"):
         )
         emb = apply_status_to_embed(emb, p, guild)
 
-        # Собрать список одобряющих и разослать DM
         approvers: set[int] = set()
         for m in guild.members:
             if member_has_any_role(m, APPROVER_ROLE_IDS):
@@ -465,10 +524,10 @@ class PetitionModal(discord.ui.Modal, title="Подача петиции"):
                 msg = await dm.send(embed=emb, view=ApproverView(petition_id))
                 p.approver_messages[appr_id] = (dm.id, msg.id)
             except Exception:
-                # игнорируем закрытые ЛС/ошибки
                 pass
 
-        # Сообщение автору о рассылке
+        save_petitions()
+
         try:
             await interaction.user.send(
                 f"Петиция № {petition_id} отправлена ответственным органам власти."
@@ -480,6 +539,7 @@ class PetitionModal(discord.ui.Modal, title="Подача петиции"):
 # =========================
 # Slash-команды (только DM)
 # =========================
+
 @bot.tree.command(name="help", description="Инструкция по использованию бота")
 async def help_cmd(interaction: discord.Interaction):
     if interaction.guild is not None:
@@ -514,10 +574,18 @@ async def petition_cmd(interaction: discord.Interaction):
 # =========================
 # События
 # =========================
+
 @bot.event
 async def on_ready():
+    # Регистрируем persistent view'ы для уже существующих петиций
+    for p in petitions.values():
+        if p.status == "pending":
+            bot.add_view(ApproverView(p.id))
+        elif p.status == "accepted":
+            bot.add_view(FinishView(p.id))
+
     try:
-        await bot.tree.sync()  # глобальная регистрация слэш-команд
+        await bot.tree.sync()
         print("Slash commands synced.")
     except Exception as e:
         print(f"Slash sync error: {e}")
@@ -536,7 +604,6 @@ async def on_voice_state_update(
     before: discord.VoiceState,
     after: discord.VoiceState
 ):
-    # Интересует только сам бот
     if not member.bot or not bot.user or member.id != bot.user.id:
         return
 
@@ -548,17 +615,14 @@ async def on_voice_state_update(
     before_ch = before.channel
     after_ch = after.channel
 
-    # Если бот вышел или оказался не в целевом канале — вернуть его
     if after_ch is None or after_ch.id != target.id:
-        # Лёгкая задержка, чтобы не мешать внутреннему reconnect
         await asyncio.sleep(1)
 
         async with voice_rejoin_lock:
-            # Повторная проверка внутри lock
             vc = guild.voice_client
             current_ch = vc.channel if vc and vc.is_connected() else None
             if isinstance(current_ch, discord.VoiceChannel) and current_ch.id == target.id:
-                return  # уже где надо
+                return
 
             try:
                 await ensure_voice_in_guild(guild)
@@ -567,7 +631,6 @@ async def on_voice_state_update(
 
         return
 
-    # Если бот только что вошёл в целевой канал — играем звук
     if after_ch and after_ch.id == target.id and (
         before_ch is None or before_ch.id != target.id
     ):
@@ -576,7 +639,6 @@ async def on_voice_state_update(
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Триггер по вебхуку в новостном канале — звук
     if (
         message.author.bot
         and message.webhook_id is not None
@@ -587,6 +649,10 @@ async def on_message(message: discord.Message):
             await play_sound_in_guild(guild)
 
 
-# Запуск
+# =========================
+# Старт: сначала грузим JSON
+# =========================
+
 if __name__ == "__main__":
+    load_petitions()
     bot.run(TOKEN)
