@@ -639,14 +639,16 @@ async def on_voice_state_update(
 
 @bot.event
 async def on_message(message: discord.Message):
-    if (
-        message.author.bot
-        and message.webhook_id is not None
-        and message.channel.id == NEWS_CHANNEL_ID
-    ):
+    # игнорируем свои же сообщения, чтобы не было циклов
+    if message.author.id == bot.user.id:
+        return
+
+    # любой бот в NEWS_CHANNEL_ID
+    if message.author.bot and message.channel.id == NEWS_CHANNEL_ID:
         guild = bot.get_guild(GUILD_ID)
         if guild:
             await play_sound_in_guild(guild)
+
 
 
 # =========================
